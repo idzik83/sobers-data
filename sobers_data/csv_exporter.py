@@ -1,13 +1,14 @@
 import csv
 import os
 
-from .models import get_transformer, BankDataLineTransformer
+from .models import BankDataLineTransformer, get_transformer
 
 
 class CSVBankDataExporter:
     """
     CSV data exporter keeps common output data format
     """
+
     def __init__(self, csv_folder_path: str, output_file_path: str):
         self._csv_folder_path = csv_folder_path
         self._folder_path = output_file_path

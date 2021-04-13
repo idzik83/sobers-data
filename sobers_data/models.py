@@ -1,9 +1,7 @@
 import abc
 import copy
 import datetime
-from collections import OrderedDict
-from typing import Any, Dict, List
-
+from typing import Any, Dict, Iterable, List, Optional
 
 COMMON_DATE_FORMAT = "%d-%m-%Y"
 VALID_TRANSACTIONS_TYPE = ["remove", "add"]
@@ -14,11 +12,11 @@ class AbstractField(abc.ABC):
     Validates and transforms field's value
     """
     @abc.abstractmethod
-    def validate(self, value: Any) -> Any:
+    def validate(self, line: Dict) -> Any:
         pass
 
     @abc.abstractmethod
-    def transform(self, value: Any) -> Dict:
+    def transform(self, line: Dict) -> Dict:
         pass
 
 
@@ -26,38 +24,46 @@ class TypedField(AbstractField):
     """
     Validates field type is expected format
     """
-    def __init__(self, name: str, field_type: type):
+
+    def __init__(self, name: str, field_type: type, from_field: Optional[str] = None):
         if not isinstance(field_type, type):
             raise ValueError(f"Field type expected to be type type, got {type(field_type)}")
-        self._type = field_type
+        self.type = field_type
         self.name = name
+        self.from_field = from_field or name
 
-    def validate(self, value: Any) -> Any:
-        if not isinstance(value, self._type):
-            raise ValueError(f"Field type {value} has improper type, expected {self._type}, got {type(value)}")
+    def validate(self, line: Dict) -> Any:
+        try:
+            value = line[self.from_field]
+        except KeyError:
+            raise ValueError(f"Field {self.from_field} not found in the line")
+        if not isinstance(value, self.type):
+            raise ValueError(f"Field type {line} has improper type, expected {self.type}, got {type(line)}")
         return value
 
-    def transform(self, value: Any) -> Dict:
-        return {self.name: self.validate(value)}
+    def transform(self, line: Dict) -> Dict:
+        return {self.name: self.validate(line)}
 
 
 class DateField(TypedField):
     """
     Validates and transforms date fields into common format
     """
-    def __init__(self, name: str, field_type: type, fmt: str):
-        super().__init__(name, field_type)
+
+    def __init__(self, name: str, field_type: type, fmt: str, from_field: Optional[str] = None):
+        super().__init__(name, field_type, from_field)
         self._format = fmt
 
-    def validate(self, value: str) -> datetime.datetime:
+    def validate(self, line: Dict) -> datetime.datetime:
+        value = super().validate(line)
         try:
             date = datetime.datetime.strptime(value, self._format)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"Unexpected timestamp format, expected {self._format}, got {value}") from exc
         return date
 
-    def transform(self, value: str) -> Dict:
-        validated_field = self.validate(value)
+    def transform(self, line: Dict) -> Dict:
+        validated_field = self.validate(line)
         return {self.name: validated_field.strftime(COMMON_DATE_FORMAT)}
 
 
@@ -65,8 +71,9 @@ class OneOfField(TypedField):
     """
     Validates the field value is one of the values in the scope
     """
-    def __init__(self, name: str, field_type: type, scope: List[str]):
-        super().__init__(name, field_type)
+
+    def __init__(self, name: str, field_type: type, scope: List[str], from_field: Optional[str] = None):
+        super().__init__(name, field_type, from_field)
         self.scope = self._validate_scope(scope)
 
     def _validate_scope(self, scope: List[str]) -> List[str]:
@@ -75,100 +82,100 @@ class OneOfField(TypedField):
                 raise ValueError(f"Scope items expected to be str, got {type(item)}")
         return scope.copy()
 
-    def validate(self, value: str) -> str:
+    def validate(self, line: Dict) -> str:
+        value = super().validate(line)
         if value not in self.scope:
             ValueError(f"{value} is not in the list of values: {self.scope}")
         return value
+
+
+class MonetaryField(AbstractField):
+    def __init__(self, name: str, euro: TypedField, cents: TypedField):
+        self._euro = euro
+        self._cents = cents
+        self.name = name
+
+    @property
+    def from_field(self):
+        return [self._euro.from_field, self._cents.from_field]
+
+    def validate(self, line: Dict) -> Dict:
+        return {self._euro.name: self._euro.validate(line), self._cents.name: self._cents.validate(line)}
+
+    def transform(self, line: Dict) -> Dict:
+        values = self.validate(line)
+        combined_value = float(f"{values[self._euro.name]}.{values[self._cents.name]}")
+        return {self.name: combined_value}
 
 
 class BankDataLineTransformer:
     """
     Transforms the line of the data into format according to the provided schema
     """
-    def __init__(self, schema: Dict[str, AbstractField]):
+
+    def __init__(self, schema: Iterable[AbstractField]):
         self._schema = self._validate_schema(schema)
 
     @property
     def fields(self):
-        return [field.name for _, field in self._schema.items()]
+        return [field.name for field in self._schema]
 
     @property
     def schema_fields(self):
-        return self._schema.keys()
+        fields = []
+        for field in self._schema:
+            if isinstance(field.from_field, list):
+                fields.extend(field.from_field)
+            else:
+                fields.append(field.from_field)
+        return fields
 
-    def _validate_schema(self, schema: Dict[str, AbstractField]):
-        for field_name, field_type in schema.items():
-            if not isinstance(field_name, str):
-                raise ValueError(f"Fields names expected to be type str, got {type(field_name)}")
+    def _validate_schema(self, schema: Iterable[AbstractField]) -> Iterable[AbstractField]:
+        for field_type in schema:
             if not isinstance(field_type, AbstractField):
                 raise ValueError(f"Fields types expected to be type AbstractField, got {type(field_type)}")
         return copy.deepcopy(schema)
 
-    def transform(self, line: dict) -> dict:
+    def transform(self, line: Dict) -> dict:
         transformed = {}
-        for field, value in line.items():
-            try:
-                transformer = self._schema[field]
-            except KeyError:
-                raise ValueError(
-                    f"Field name {field} is unexpected by the schema, expected fields: {list(self._schema.keys())}"
-                )
-            transformed.update(transformer.transform(value))
+        for field in self._schema:
+            transformed.update(field.transform(line))
         return transformed
 
 
-class BankDataEuroCentsLineTransformer(BankDataLineTransformer):
-    """
-    Merges line containing euros and cents values into single amount field
-    """
-
-    @property
-    def fields(self):
-        return ["date", "transaction", "amount", "from", "to"]
-
-    def transform(self, line: dict) -> dict:
-        transformed = super().transform(line)
-        try:
-            euro = transformed.pop("euro")
-            cents = transformed.pop("cents")
-        except KeyError:
-            raise ValueError(f"Fields euro or cents are not found in the line: {line}")
-        transformed["amount"] = float(f"{euro}.{cents}")
-        return transformed
+bank_1_schema = (
+    DateField(name="date", field_type=str, fmt="%b %d %Y", from_field="timestamp"),
+    OneOfField(name="transaction", field_type=str, scope=VALID_TRANSACTIONS_TYPE, from_field="type"),
+    TypedField(name="amount", field_type=str),
+    TypedField(name="from", field_type=str),
+    TypedField(name="to", field_type=str),
+)
 
 
-bank_1_schema = OrderedDict({
-    "timestamp": DateField("date", str, "%b %d %Y"),
-    "type": OneOfField("transaction", str, VALID_TRANSACTIONS_TYPE),
-    "amount": TypedField("amount", str),
-    "from": TypedField("from", str),
-    "to": TypedField("to", str)
-})
+bank_2_schema = (
+    DateField(name="date", field_type=str, fmt=COMMON_DATE_FORMAT, from_field="date"),
+    OneOfField(name="transaction", field_type=str, scope=VALID_TRANSACTIONS_TYPE),
+    TypedField(name="amount", field_type=str, from_field="amounts"),
+    TypedField(name="from", field_type=str),
+    TypedField(name="to", field_type=str),
+)
 
 
-bank_2_schema = OrderedDict({
-    "date": DateField("date", str, COMMON_DATE_FORMAT),
-    "transaction": OneOfField("transaction", str, VALID_TRANSACTIONS_TYPE),
-    "amounts": TypedField("amount", str),
-    "from": TypedField("from", str),
-    "to": TypedField("to", str)
-})
-
-
-bank_3_schema = OrderedDict({
-    "date_readable": DateField("date", str, "%d %b %Y"),
-    "type": OneOfField("transaction", str, VALID_TRANSACTIONS_TYPE),
-    "euro": TypedField("euro", str),
-    "cents": TypedField("cents", str),
-    "from": TypedField("from", str),
-    "to": TypedField("to", str)
-})
+bank_3_schema = (
+    DateField(name="date", field_type=str, fmt="%d %b %Y", from_field="date_readable"),
+    OneOfField(name="transaction", field_type=str, scope=VALID_TRANSACTIONS_TYPE, from_field="type"),
+    MonetaryField(
+        name="amount", euro=TypedField(name="euro", field_type=str), cents=TypedField(name="cents", field_type=str)
+    ),
+    TypedField(name="from", field_type=str),
+    TypedField(name="to", field_type=str),
+)
 
 
 registered_transformers = (
     BankDataLineTransformer(bank_1_schema),
     BankDataLineTransformer(bank_2_schema),
-    BankDataEuroCentsLineTransformer(bank_3_schema)
+    BankDataLineTransformer(bank_3_schema),
 )
 
 
